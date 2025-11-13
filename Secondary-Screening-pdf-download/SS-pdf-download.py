@@ -1,232 +1,151 @@
-import os
-import time
-import requests
-import pandas as pd
-from bs4 import BeautifulSoup
-from bs4 import XMLParsedAsHTMLWarning
-import warnings
-
-# Suppress XML parser warnings
-warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
-
-# === CONFIG ===
-all_merged_file = "All-Merged.xlsx"   # File containing PMID + DOI
-pmid_file = "pmid.xlsx"               # File to update and download from
-download_folder = os.path.join(os.getcwd(), "Downloaded Papers")
-os.makedirs(download_folder, exist_ok=True)
-
-# === STEP 1: LOAD DATA ===
-print("🔹 Loading data...")
-all_merged_df = pd.read_excel(all_merged_file)
-pmid_df = pd.read_excel(pmid_file)
-
-# Ensure necessary columns exist
-for col in ["DOI", "Status"]:
-    if col not in pmid_df.columns:
-        pmid_df[col] = ""
-
-# Convert PMIDs to string
-all_merged_df["PMID"] = all_merged_df["PMID"].astype(str)
-pmid_df["PMID"] = pmid_df["PMID"].astype(str)
-
-# === STEP 2: UPDATE DOI FROM ALL-MERGED ===
-print("🔹 Updating DOI column in pmid.xlsx...")
-pmid_df["DOI"] = pmid_df["PMID"].map(
-    all_merged_df.set_index("PMID")["DOI"].to_dict()
-)
-
-# Save updated pmid.xlsx
-pmid_df.to_excel(pmid_file, index=False)
-print("✅ DOI column updated and saved in pmid.xlsx")
-
-# === STEP 3: DOWNLOAD PAPERS ===
-def save_file_from_url(url, filepath):
-    """Download content and save to file if not empty."""
-    try:
-        response = requests.get(url, timeout=20)
-        if response.status_code == 200 and len(response.content) > 1000:
-            with open(filepath, "wb") as f:
-                f.write(response.content)
-            return True
-    except Exception as e:
-        print(f"  ⚠️ Error: {e}")
-    return False
-
-print("\n🔹 Starting download of papers...")
-for idx, row in pmid_df.iterrows():
-    pmid = str(row["PMID"])
-    doi = str(row["DOI"]) if pd.notna(row["DOI"]) else ""
-    print(f"[{idx+1}/{len(pmid_df)}] Processing PMID {pmid}...")
-
-    # File paths
-    safe_name = pmid.replace("/", "_")
-    pdf_path = os.path.join(download_folder, f"{safe_name}.pdf")
-    html_path = os.path.join(download_folder, f"{safe_name}.html")
-
-    # If PDF already exists, mark as Downloaded
-    if os.path.exists(pdf_path):
-        print("  ⏭️ PDF already exists")
-        pmid_df.loc[idx, "Status"] = "Downloaded"
-        continue
-
-    # Skip if no DOI
-    if not doi:
-        print("  ❌ DOI not found.")
-        pmid_df.loc[idx, "Status"] = ""  # leave blank
-        continue
-
-    downloaded = False
-
-    # 1️⃣ Try DOI PDF link
-    pdf_url = f"https://doi.org/{doi}"
-    print(f"  ⏳ Trying DOI link: {pdf_url}")
-    downloaded = save_file_from_url(pdf_url, pdf_path)
-
-    # 2️⃣ Try PMC fallback if not downloaded
-    if not downloaded:
-        print("  ⏳ Trying PMC fallback...")
-        try:
-            pmc_resp = requests.get(
-                f"https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/?ids={doi}&format=json"
-            )
-            pmc_data = pmc_resp.json()
-            pmcid = pmc_data['records'][0].get('pmcid')
-            if pmcid:
-                xml_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/"
-                downloaded = save_file_from_url(xml_url, html_path)
-        except Exception as e:
-            print(f"  ⚠️ PMC fallback failed: {e}")
-
-    # ✅ Only mark as Downloaded if actual PDF exists
-    if downloaded and os.path.exists(pdf_path):
-        pmid_df.loc[idx, "Status"] = "Downloaded-paper"
-        print(f"  ✅ Saved PDF for PMID {pmid}")
-    else:
-        pmid_df.loc[idx, "Status"] = ""  # leave blank
-        print(f"  ❌ Could not download PMID {pmid}")
-
-    time.sleep(1)  # polite delay
-
-# === STEP 4: SAVE FINAL RESULTS ===
-pmid_df.to_excel(pmid_file, index=False)
-print("\n✅ All done! Only entries with actual PDFs marked as 'Downloaded'.")
-print(f"📁 Files saved in: {download_folder}")
-
-
-
 import pandas as pd
 from Bio import Entrez
+import time
 
 # === CONFIG ===
-Entrez.email = "your_email@example.com"  # Replace with your email (required by NCBI)
+Entrez.email = "your_email@example.com"   #  Replace with your valid email
 excel_file = "pmid.xlsx"
-pmid_column = "PMID"
 
-# === STEP 1: READ EXISTING EXCEL ===
-print("🔹 Loading existing pmid.xlsx...")
+# === STEP 1: Load Excel ===
 df = pd.read_excel(excel_file)
 
-# Ensure columns exist
-if "PMC_ID" not in df.columns:
-    df["PMC_ID"] = ""
-if "PDF_Link" not in df.columns:
-    df["PDF_Link"] = ""
+# Ensure correct column
+if 'PMID' not in df.columns:
+    raise ValueError("The Excel file must have a column named 'PMID'")
 
-# === STEP 2: PROCESS ONLY BLANK STATUS ROWS ===
-blank_rows = df[df["Status"].isna() | (df["Status"].astype(str).str.strip() == "")]
-print(f"🔹 Found {len(blank_rows)} entries with blank Status.")
+# Add columns if missing
+if 'PMCID' not in df.columns:
+    df['PMCID'] = ""
+if 'PDF_Link' not in df.columns:
+    df['PDF_Link'] = ""
 
-for i, row in blank_rows.iterrows():
-    pmid = str(row[pmid_column])
-    print(f"[{i+1}/{len(blank_rows)}] Processing PMID {pmid}...")
+# === STEP 2: Fetch PMCID for each PMID ===
+for i, row in df.iterrows():
+    pmid = str(row['PMID'])
+
+    # Skip already-filled rows
+    if pd.notna(row.get('PMCID')) and str(row['PMCID']).startswith('PMC'):
+        print(f"[{pmid}] ⏩ Already has PMCID, skipping")
+        continue
 
     try:
-        handle = Entrez.elink(dbfrom="pubmed", id=pmid, linkname="pubmed_pmc")
+        handle = Entrez.elink(dbfrom="pubmed", db="pmc", id=pmid)
         record = Entrez.read(handle)
         handle.close()
 
-        # Extract PMC ID if available
-        pmc_id = record[0]['LinkSetDb'][0]['Link'][0]['Id']
-        pdf_url = f"https://pmc.ncbi.nlm.nih.gov/articles/PMC{pmc_id}/pdf/"
+        if record and record[0].get("LinkSetDb"):
+            pmcid = record[0]["LinkSetDb"][0]["Link"][0]["Id"]
+            df.at[i, 'PMCID'] = f"PMC{pmcid}"
+            df.at[i, 'PDF_Link'] = f"https://pmc.ncbi.nlm.nih.gov/articles/PMC{pmcid}/pdf/"
+            print(f"[{pmid}]  PMCID: PMC{pmcid}")
+        else:
+            print(f"[{pmid}]  No PMCID found")
 
-        df.loc[i, "PMC_ID"] = f"PMC{pmc_id}"
-        df.loc[i, "PDF_Link"] = pdf_url
-
-        print(f"✅ Found PMC{pmc_id}")
-    except (IndexError, KeyError):
-        print(f"❌ No PMC full-text found for PMID {pmid}")
     except Exception as e:
-        print(f"⚠️ Error processing PMID {pmid}: {e}")
+        print(f"[{pmid}]  Error: {e}")
 
-# === STEP 3: SAVE BACK TO SAME FILE ===
+    # Respect NCBI API rate limits
+    time.sleep(0.5)
+
+# === STEP 3: Save updated Excel ===
 df.to_excel(excel_file, index=False)
-print("\n✅ Done! 'pmid.xlsx' updated with new columns PMC_ID and PDF_Link.")
+print(f"\n Updated successfully — 'PMCID' and 'PDF_Link' columns saved to {excel_file}")
+
 
 import os
 import time
-import requests
 import pandas as pd
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import WebDriverException
+from webdriver_manager.chrome import ChromeDriverManager
 
 # === CONFIG ===
 excel_file = "pmid.xlsx"
-download_folder = os.path.join(os.getcwd(), "Downloaded Papers")
+download_folder = os.path.join(os.getcwd(), "pdf download")
 os.makedirs(download_folder, exist_ok=True)
 
-# Browser-like headers for PMC PDFs
-headers = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/123.0.0.0 Safari/537.36"
-    ),
-    "Referer": "https://www.ncbi.nlm.nih.gov/pmc/",
-    "Accept": "application/pdf",
-    "Connection": "keep-alive",
-}
-
-# === STEP 1: LOAD EXISTING EXCEL ===
-print("🔹 Loading pmid.xlsx...")
+# === STEP 1: Load Excel ===
 df = pd.read_excel(excel_file)
 
-# Ensure columns exist
-if "PDF_Link" not in df.columns:
-    df["PDF_Link"] = ""
-if "Status" not in df.columns:
-    df["Status"] = ""
+if 'PDF_Link' not in df.columns:
+    raise ValueError("Excel file must have a column named 'PDF_Link'")
 
-# === STEP 2: DOWNLOAD PDFs WHERE LINK EXISTS ===
-link_rows = df[df["PDF_Link"].notna() & (df["PDF_Link"].str.strip() != "")]
-print(f"🔹 Found {len(link_rows)} entries with PDF_Link.")
+if 'Status' not in df.columns:
+    df['Status'] = ""
 
-for i, row in link_rows.iterrows():
-    pmid = str(row["PMID"])
-    pdf_url = row["PDF_Link"].strip()
-    pdf_path = os.path.join(download_folder, f"{pmid}.pdf")
+valid_rows = df[df['PDF_Link'].notna() & (df['PDF_Link'] != "")]
+print(f" Found {len(valid_rows)} valid PDF links to download.\n")
 
-    # Skip if PDF already exists
-    if os.path.exists(pdf_path):
-        print(f"[{i+1}/{len(link_rows)}] {pmid}: PDF already exists")
-        df.loc[i, "Status"] = "Downloaded"
+# === STEP 2: Setup Chrome ===
+chrome_options = Options()
+chrome_options.add_argument("--start-maximized")
+prefs = {
+    "download.default_directory": download_folder,
+    "download.prompt_for_download": False,
+    "download.directory_upgrade": True,
+    "plugins.always_open_pdf_externally": True,
+}
+chrome_options.add_experimental_option("prefs", prefs)
+
+driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+driver.maximize_window()
+
+# === STEP 3: Download PDFs and update status ===
+for i, row in valid_rows.iterrows():
+    pmid = str(row.get("PMID", "Unknown"))
+    pdf_url = str(row["PDF_Link"]).strip()
+
+    if not pdf_url.startswith("http"):
+        print(f"[{pmid}]  Invalid URL, skipping")
         continue
 
+    print(f"[{pmid}]  Opening {pdf_url}")
     try:
-        print(f"[{i+1}/{len(link_rows)}] {pmid}: Downloading from {pdf_url} ...")
-        response = requests.get(pdf_url, headers=headers, timeout=60)
-        response.raise_for_status()
+        driver.get(pdf_url)
+        time.sleep(2)
 
-        # Save the PDF
-        with open(pdf_path, "wb") as f:
-            f.write(response.content)
+        # Wait for a new PDF to appear and finish downloading
+        timeout = 60  # wait max 60 seconds
+        start_time = time.time()
+        downloaded_file = None
 
-        df.loc[i, "Status"] = "Downloaded"
-        print(f"  ✅ Downloaded successfully.")
-    except Exception as e:
-        df.loc[i, "Status"] = ""  # leave blank if failed
-        print(f"  ❌ Failed to download: {e}")
+        while time.time() - start_time < timeout:
+            files = [f for f in os.listdir(download_folder) if f.lower().endswith(".pdf")]
+            # Only pick files that are fully downloaded (no .crdownload)
+            ready_files = [f for f in files if not f.endswith(".crdownload")]
+            if ready_files:
+                downloaded_file = max(
+                    [os.path.join(download_folder, f) for f in ready_files],
+                    key=os.path.getctime
+                )
+                break
+            time.sleep(1)
 
-    time.sleep(1)  # polite delay
+        if not downloaded_file:
+            print(f"[{pmid}]  No fully downloaded PDF detected after {timeout}s")
+            continue
 
-# === STEP 3: SAVE BACK TO SAME EXCEL ===
+        # Rename the downloaded file safely
+        new_path = os.path.join(download_folder, f"{pmid}.pdf")
+        try:
+            os.rename(downloaded_file, new_path)
+        except PermissionError:
+            # Wait a bit and retry
+            time.sleep(2)
+            os.rename(downloaded_file, new_path)
+
+        # Update status in Excel
+        df.at[i, 'Status'] = "Downloaded-S"
+        print(f"[{pmid}]  Saved as {pmid}.pdf and status updated")
+
+    except WebDriverException as e:
+        print(f"[{pmid}]  Error: {e}")
+
+# === STEP 4: Save Excel ===
 df.to_excel(excel_file, index=False)
-print("\n✅ Done! 'pmid.xlsx' updated with downloaded PDFs and Status.")
-print(f"📁 PDFs saved in: {download_folder}")
+driver.quit()
+print(f"\n All downloads complete. Status column updated in '{excel_file}'")
+
+
